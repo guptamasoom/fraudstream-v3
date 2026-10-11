@@ -8,18 +8,19 @@
 
 1. [Project Overview](#1-project-overview)
 2. [Architecture Evolution: Local → Cloud](#2-architecture-evolution-local--cloud)
-3. [Step 1: Continuous Streaming Pipeline](#step-1-continuous-streaming-pipeline)
-4. [Step 2: Databricks Job Creation](#step-2-databricks-job-creation)
-5. [Step 3: Late Arriving Data Handling](#step-3-late-arriving-data-handling)
-6. [Step 4: Performance Optimization](#step-4-performance-optimization)
-7. [Step 5: Email Failure Alerts](#step-5-email-failure-alerts)
-8. [Step 6: Structured Logging](#step-6-structured-logging)
-9. [Step 7: Error Handling & Safe Wrappers](#step-7-error-handling--safe-wrappers)
-10. [Step 8: Business Anomaly Alerting](#step-8-business-anomaly-alerting)
-11. [Step 9: Git Version Control](#step-9-git-version-control)
-12. [Step 10: CI/CD Pipeline](#step-10-cicd-pipeline)
-13. [Interview Q&A](#interview-qa)
-14. [Architecture Diagram](#architecture-diagram)
+3. [Detailed Layer-by-Layer Architecture](#detailed-layer-by-layer-architecture)
+4. [Step 1: Continuous Streaming Pipeline](#step-1-continuous-streaming-pipeline)
+5. [Step 2: Databricks Job Creation](#step-2-databricks-job-creation)
+6. [Step 3: Late Arriving Data Handling](#step-3-late-arriving-data-handling)
+7. [Step 4: Performance Optimization](#step-4-performance-optimization)
+8. [Step 5: Email Failure Alerts](#step-5-email-failure-alerts)
+9. [Step 6: Structured Logging](#step-6-structured-logging)
+10. [Step 7: Error Handling & Safe Wrappers](#step-7-error-handling--safe-wrappers)
+11. [Step 8: Business Anomaly Alerting](#step-8-business-anomaly-alerting)
+12. [Step 9: Git Version Control](#step-9-git-version-control)
+13. [Step 10: CI/CD Pipeline](#step-10-cicd-pipeline)
+14. [Interview Q&A](#interview-qa)
+15. [Architecture Diagram](#architecture-diagram)
 
 ---
 
@@ -80,12 +81,417 @@ From the original `architecture.md`:
 
 ### Platform Layers (V3)
 
-1. **Event simulation**: `01_stream_generator` — generates 200 events per 5 seconds, infinitely
+1. **Event simulation**: `01_stream_generator` — generates 500 events per 5 seconds, infinitely
 2. **Bronze**: `02_bronze_stream` — Auto Loader reads JSON, applies 8 DQ checks, splits valid → Bronze Delta, invalid → quarantine
 3. **Silver**: `03_silver_stream` — reads Bronze as stream, normalizes types, deduplicates via watermark + `dropDuplicates`, writes Silver Delta
 4. **Fraud scoring**: `04_scoring_stream` — enriches with velocity features (2-day window), applies 7 weighted fraud rules, computes `risk_score` (0-100) and `risk_band` (LOW/MEDIUM/HIGH)
 5. **Gold**: `05_gold_stream` — recomputes 7 gold analytics tables every 60s (country/merchant summaries, customer/merchant/device profiles, chargeback summary, high-risk transactions)
 6. **Validation**: `06_validation_stream` — one-shot batch validation (counts, duplicates, DQ pass rate, risk bands, gold completeness)
+
+---
+
+## Detailed Layer-by-Layer Architecture
+
+This section explains exactly what each notebook does, cell by cell, with the technical implementation details.
+
+### Layer 0: 00_config_stream — Shared Configuration
+
+**Purpose**: Single source of truth for all paths, schemas, DQ checks, fraud rules, and logging. Every other notebook starts with `%run ./00_config_stream` to inherit these definitions.
+
+**Cells (7 total)**:
+
+1. **Markdown Title**: Describes the V3 streaming architecture and key difference from V2 (real-time micro-batches vs scheduled batches).
+
+2. **Imports & Data Paths**: 
+   - Imports PySpark types (`BooleanType`, `DecimalType`, `DoubleType`, `StringType`, `StructField`, `StructType`, `TimestampType`)
+   - Defines `DATA_ROOT` = UC Volume path
+   - Defines 8 layer paths: `STREAM_ROOT`, `BRONZE_ROOT`, `SILVER_ROOT`, `SCORED_ROOT`, `ALERTS_ROOT`, `QUARANTINE_ROOT`, `GOLD_ROOT`, `DQ_ROOT`, `CHECKPOINT_ROOT`
+   - Defines `STREAMS` = 4 event stream names
+   - Sets up Python `logging` module with format `%(asctime)s [%(levelname)s] %(name)s: %(message)s`
+   - Creates `logger = logging.getLogger("FraudStreamV3")`
+
+3. **Event Schemas**: Defines `StructType` schemas for all 4 event streams:
+   - `TX_SCHEMA`: 17 fields (event_id, event_type, event_timestamp, transaction_id, customer_id, merchant_id, merchant_category, amount, currency, payment_method, device_id, ip_country, billing_country, shipping_country, is_card_present, auth_result, is_known_fraud)
+   - `LOGIN_SCHEMA`: 8 fields (event_id, event_type, event_timestamp, customer_id, device_id, ip_country, user_agent, mfa_passed)
+   - `DEVICE_SCHEMA`: 7 fields (event_id, event_type, event_timestamp, customer_id, device_id, device_type, ip_country, is_new_device)
+   - `CHARGEBACK_SCHEMA`: 8 fields (event_id, event_type, event_timestamp, transaction_id, customer_id, merchant_id, chargeback_amount, reason_code)
+   - Compiled into `SCHEMAS` dict and `DQ_CHECKS_BY_STREAM` dict
+
+4. **Generation Constants & Fraud Rules**:
+   - `COUNTRIES` = ["IN", "US", "GB", "SG", "AE", "DE", "BR"]
+   - `RISK_COUNTRIES` = ["RU", "NG", "BR", "AE"] — used for fraudulent transactions
+   - `MERCHANT_CATEGORIES`, `PAYMENT_METHODS`, `DEVICE_TYPES`, `AUTH_RESULTS`, `LOGIN_TYPES`, `DEVICE_EVENT_TYPES`, `CHARGEBACK_REASONS`, `BAD_DATA_MODES`
+   - `FRAUD_RATE` = 0.08 (8% of transactions are fraudulent)
+   - `BAD_DATA_RATE` = 0.04 (4% of events have injected anomalies)
+   - `RULE_WEIGHTS` dict: 7 fraud rules with weights (20+20+20+15+10+10+15 = 110 max, clipped at 100)
+   - `HIGH_AMOUNT_THRESHOLD` = 600.0, `HIGH_VELOCITY_THRESHOLD` = 4, `MANY_CUSTOMERS_THRESHOLD` = 3, `FAILED_LOGIN_THRESHOLD` = 2
+
+5. **DQ Check Definitions**:
+   - `DQ_CHECKS_BASE`: 3 checks applied to ALL streams (event_id present, event_timestamp present, customer_id present)
+   - `DQ_CHECKS_TX`: 7 checks for transactions (base + transaction_id present, amount non-negative, valid IP country regex `^[A-Z]{2}$`, valid billing country)
+   - `DQ_CHECKS_CB`: 4 checks for chargebacks (base + chargeback_amount non-negative)
+   - Each check has: (check_name, reason_code, severity, SQL predicate)
+   - Compiled into `DQ_CHECKS_BY_STREAM` dict mapping stream_name → list of checks
+
+6. **Streaming Config**:
+   - `TRIGGER_INTERVAL_SECONDS` = 10 (micro-batch interval)
+   - `WATERMARK_DELAY` = "10 minutes" (late data tolerance for Silver dedup)
+   - Checkpoint paths for Bronze, Silver, Scoring, Gold
+   - `BATCH_SIZE` = 500 (events per generator batch, was 200)
+   - `BATCH_INTERVAL_S` = 5 (seconds between generator batches)
+   - `GENERATOR_DURATION_S` = 0 (infinite generation)
+   - Initializes structured logger with `logging.basicConfig`
+
+7. **Smoke Test**: Prints all layer paths to verify config loaded correctly.
+
+**Key Design Decisions**:
+- All config in ONE notebook → change once, affects all stages
+- `safe_foreachbatch` decorator defined here → wraps all streaming batch functions with error handling
+- `show_df` helper for debugging
+- Schemas are explicit `StructType` (not schema inference) → prevents schema drift
+
+---
+
+### Layer 1: 01_stream_generator — Event Simulation
+
+**Purpose**: Continuously generates synthetic fraud events (transactions, logins, devices, chargebacks) and writes them as JSON files to the UC volume. Auto Loader in Bronze picks these up in real-time.
+
+**Cells (6 total)**:
+
+1. **Markdown Title**: Describes the generator flow: Generate batch → Write JSON → Sleep → Repeat.
+
+2. **Run Config**: `%run ./00_config_stream` — inherits all paths, schemas, constants.
+
+3. **Imports**: `random`, `uuid`, `json`, `time`, `datetime`, `Row`. Prints start config.
+
+4. **Event Generation Functions**: 4 functions + 1 batch function:
+   - `gen_transaction()`: Generates a transaction event. If `is_fraud=True` (8% chance): amount $600-$5000, IP from `RISK_COUNTRIES` (RU, NG, BR, AE), billing from `COUNTRIES`. If normal: amount $10-$500, IP=billing country. If `is_bad=True` (4% chance): injects one of 4 anomalies (missing customer_id, negative amount, missing timestamp, invalid country "XX_INVALID").
+   - `gen_login()`: Login event with customer_id, device_id, IP country, user_agent, mfa_passed (80% pass rate).
+   - `gen_device()`: Device event with device_type, is_new_device (15% chance).
+   - `gen_chargeback()`: Chargeback event with chargeback_amount $10-$1000, reason_code from 4 options.
+   - `gen_batch(n=BATCH_SIZE)`: Generates BATCH_SIZE events. Distribution: 70% transactions, 15% logins, 10% devices, 5% chargebacks.
+
+5. **Batch Writer**: `write_batch(events)` — groups events by event_type, writes each group as a single JSONL file to `{STREAM_ROOT}/{event_type}/batch_{timestamp}.json` using `dbutils.fs.put`.
+
+6. **Start Generation**: Infinite loop:
+   - Generate batch of BATCH_SIZE events
+   - Write JSON files to UC volume
+   - Log: `[Generator] Batch {N} | {count} events | Total: {total} | Elapsed: {seconds}s`
+   - Sleep BATCH_INTERVAL_S (5 seconds)
+   - Repeat forever (GENERATOR_DURATION_S=0)
+   - KeyboardInterrupt handler for graceful stop
+
+**Output**: JSONL files in `{STREAM_ROOT}/fraud_transactions/`, `{STREAM_ROOT}/fraud_logins/`, `{STREAM_ROOT}/fraud_devices/`, `{STREAM_ROOT}/fraud_chargebacks/`
+
+**Event Distribution**: 70% transactions, 15% logins, 10% devices, 5% chargebacks
+
+**Fraud Injection**: 8% of transactions are fraudulent (high amount + risk country + country mismatch). 4% of all events have bad data (missing fields, negative amounts, invalid countries).
+
+---
+
+### Layer 2: 02_bronze_stream — Auto Loader Ingestion + DQ
+
+**Purpose**: Uses Auto Loader (`cloudFiles`) to continuously read incoming JSON files, applies 8 Data Quality checks, splits valid → Bronze Delta tables, invalid → quarantine Delta tables.
+
+**Cells (6 total)**:
+
+1. **Markdown Title**: Describes Auto Loader flow and that it runs indefinitely.
+
+2. **Run Config**: `%run ./00_config_stream`
+
+3. **Imports**: PySpark functions (`col`, `expr`, `current_timestamp`, `to_date`, `lit`, `when`), `DeltaTable`.
+
+4. **Bronze Stream Builder** (`build_bronze_stream(stream_name)`):
+   - **Auto Loader**: `spark.readStream.format("cloudFiles")` with:
+     - `cloudFiles.format = "json"` — reads JSONL files
+     - `cloudFiles.schemaLocation` — stores schema evolution info
+     - `schema = SCHEMAS[stream_name]` — explicit StructType (no inference)
+     - Source path: `{STREAM_ROOT}/{stream_name}/`
+   - **DQ Checks**: Combines all predicates for the stream into a single SQL expression with AND. Adds `dq_passed` boolean column.
+   - **Enrichment**: Adds `ingested_at` (current_timestamp) and `event_date` (to_date from event_timestamp).
+   - **foreachBatch** (`@safe_foreachbatch`): 
+     - Splits dataframe: `valid = df.where(dq_passed == True)`, `invalid = df.where(dq_passed == False)`
+     - Fills null event_date with "1970-01-01" for records with missing timestamps
+     - **Optimized**: Single `groupBy("dq_passed").count().collect()` to get both valid and invalid counts in ONE Spark job (was 5 separate count() calls)
+     - Valid events → `mode("append")` + `partitionBy("event_date")` → Bronze Delta
+     - Invalid events → add `check_name`, `reason_code="DQ_CHECK_FAILED"`, `severity="critical"` → quarantine Delta with `mergeSchema=true`
+     - Handles chargeback `reason_code` column collision by renaming to `chargeback_reason_code`
+     - Logs: `[Bronze:{stream}] batch {id}: {valid_count} valid → Bronze` (INFO) and `{invalid_count} invalid → Quarantine` (WARNING)
+   - **Streaming query**: `foreachBatch` + `checkpointLocation` + `trigger(processingTime='10s')` + `queryName(f"bronze_{stream_name}")`
+
+5. **Start All Bronze Streams**: Loops over 4 stream names, starts 4 concurrent Auto Loader queries.
+
+6. **Monitor**: `awaitTermination()` + prints Bronze and quarantine counts for verification.
+
+**DQ Checks Applied**:
+
+| Stream | Checks | Count |
+|--------|--------|-------|
+| fraud_transactions | event_id present, event_timestamp present, customer_id present, transaction_id present, amount ≥ 0, valid IP country (regex `^[A-Z]{2}$`), valid billing country | 7 |
+| fraud_logins | event_id present, event_timestamp present, customer_id present | 3 |
+| fraud_devices | event_id present, event_timestamp present, customer_id present | 3 |
+| fraud_chargebacks | event_id present, event_timestamp present, customer_id present, chargeback_amount ≥ 0 | 4 |
+
+**Output**: 
+- Bronze Delta tables: `{BRONZE_ROOT}/{stream_name}/` (partitioned by `event_date`)
+- Quarantine Delta tables: `{QUARANTINE_ROOT}/{stream_name}/` (with DQ failure metadata)
+
+**DQ Pass Rate** (from validation): 97.4% (8,938 valid / 9,177 total), 239 quarantined records
+
+---
+
+### Layer 3: 03_silver_stream — Normalization + Deduplication
+
+**Purpose**: Reads Bronze Delta tables as a stream, casts data types, deduplicates by `event_id` using watermark + `dropDuplicates`, and writes clean Silver Delta tables.
+
+**Cells (6 total)**:
+
+1. **Markdown Title**: Describes Silver flow — Bronze stream → cast types → watermark + dedup → Silver Delta.
+
+2. **Run Config**: `%run ./00_config_stream`
+
+3. **Imports**: PySpark functions (`col`, `current_timestamp`, `to_date`, `expr`).
+
+4. **Silver Stream Builder** (`build_silver_stream(stream_name)`):
+   - **Read Bronze as stream**: `spark.readStream.format("delta").load(bronze_path)` — reads Bronze Delta incrementally
+   - **Type casting**: `event_timestamp` → `event_ts` (cast to timestamp)
+   - **Watermark + Dedup**: 
+     ```python
+     .withWatermark("event_ts", WATERMARK_DELAY)  # "10 minutes"
+     .dropDuplicates(["event_id"])
+     ```
+     The watermark tells Spark to keep dedup state for 10 minutes. Events within the window are deduplicated; older events are dropped and state is cleaned up.
+   - **Enrichment**: Adds `event_date` (to_date from event_ts), `processed_at` (current_timestamp). Drops intermediate `event_ts` column.
+   - **foreachBatch** (`@safe_foreachbatch`):
+     - `mode("append")` + `partitionBy("event_date")` → Silver Delta
+     - Logs: `[Silver:{stream}] batch {id}: written to Silver` (INFO)
+     - Error handling: catches, logs, and re-raises (triggering Structured Streaming retry)
+   - **Streaming query**: `foreachBatch` + `checkpointLocation` + `trigger(processingTime='10s')` + `queryName(f"silver_{stream_name}")`
+
+5. **Start All Silver Streams**: Loops over 4 stream names, starts 4 concurrent streaming queries.
+
+6. **Monitor**: `awaitTermination()` + prints Silver counts with distinct event_id verification.
+
+**Key Concepts**:
+
+- **Watermark**: `withWatermark("event_ts", "10 minutes")` — Spark keeps state for 10 minutes. Events arriving within 10 minutes of the latest seen event are processed. Events older than the watermark are dropped (state cleanup to prevent unbounded memory growth).
+- **dropDuplicates**: `dropDuplicates(["event_id"])` — within the watermark window, if the same `event_id` appears twice, only the first occurrence is kept. This provides exactly-once processing semantics.
+- **Why not just `mode("overwrite")`?**: Silver uses `mode("append")` because it's a streaming write. Overwrite would destroy previous data on every micro-batch.
+
+**Output**: Silver Delta tables: `{SILVER_ROOT}/{stream_name}/` (partitioned by `event_date`)
+
+**Dedup Results** (from validation): 
+- Bronze total: 8,938 → Silver total: 8,372 (566 duplicates removed, ~6.3%)
+- Zero duplicates remaining in Silver (verified by validation: 0 duplicates out of 5,804 transactions)
+
+---
+
+### Layer 4: 04_scoring_stream — Fraud Scoring + Alerting
+
+**Purpose**: Reads Silver transactions as a stream, enriches with velocity features (customer transaction count, device customer count, failed login count), applies 7 weighted fraud rules, computes `risk_score` (0-100) and `risk_band` (LOW/MEDIUM/HIGH), and writes to scored Delta table. HIGH risk transactions also go to a real-time alerts table.
+
+**Cells (7 total)**:
+
+1. **Markdown Title**: Describes the scoring approach — `foreachBatch` allows joining with historical Silver data for velocity features.
+
+2. **Run Config**: `%run ./00_config_stream`
+
+3. **Imports**: PySpark functions (`col`, `when`, `lit`, `sum`, `count`, `countDistinct`, `max`, `greatest`, `least`, `concat_ws`, `current_timestamp`, `to_date`), `DeltaTable`.
+
+4. **Scoring foreachBatch** (`@safe_foreachbatch process_scoring_batch(batch_df, batch_id)`):
+
+   **Step 4a — Read historical Silver data (2-day window)**:
+   ```python
+   lookback = date_sub(current_date(), 1)  # 2 days
+   tx_all = spark.read.format("delta").load(SILVER/fraud_transactions).where(event_date >= lookback)
+   login_all = spark.read.format("delta").load(SILVER/fraud_logins).where(event_date >= lookback)
+   device_all = spark.read.format("delta").load(SILVER/fraud_devices).where(event_date >= lookback)
+   ```
+   **Optimization**: Only reads last 2 days instead of entire Silver table. As data grows, this keeps the scan bounded.
+
+   **Step 4b — Compute velocity features (5 aggregations)**:
+   - `customer_velocity`: GROUP BY customer_id → `customer_txn_count`, `customer_total_amount`
+   - `merchant_velocity`: GROUP BY merchant_id → `merchant_txn_count`
+   - `device_customers`: GROUP BY device_id → `device_customer_count` (countDistinct customer_id)
+   - `failed_logins`: WHERE event_type = "login_failed" GROUP BY customer_id → `failed_login_count`
+   - `device_flags`: GROUP BY device_id → `is_new_device_flag` (max of is_new_device)
+
+   **Step 4c — Enrich micro-batch with velocity features**:
+   - LEFT JOIN batch_df with all 5 velocity aggregations
+   - Fill nulls from left joins (customer_txn_count=1, merchant_txn_count=1, device_customer_count=1, failed_login_count=0, is_new_device=False)
+
+   **Step 4d — Apply 7 fraud rules**:
+   | Rule | Logic | Weight |
+   |------|-------|--------|
+   | `rule_high_amount` | amount ≥ 600.0 | 20 |
+   | `rule_country_mismatch` | ip_country ≠ billing_country OR shipping_country ≠ billing_country | 20 |
+   | `rule_new_device_high_amount` | is_new_device AND rule_high_amount | 20 |
+   | `rule_high_velocity` | customer_txn_count ≥ 4 | 15 |
+   | `rule_many_customers_on_device` | device_customer_count ≥ 3 | 10 |
+   | `rule_failed_login_before_purchase` | failed_login_count ≥ 2 | 10 |
+   | `rule_card_not_present_risk` | payment_method = "card_not_present" AND rule_country_mismatch | 15 |
+
+   **Step 4e — Compute risk_score and risk_band**:
+   ```python
+   risk_score = least(sum(rule_weight * rule_triggered), 100)  # clip at 100
+   risk_band = if score >= 70: HIGH, if score >= 40: MEDIUM, else LOW
+   ```
+
+   **Step 4f — Generate fraud reason codes**:
+   ```python
+   fraud_reason_codes = concat_ws(",", when(rule_high_amount, "HIGH_AMOUNT"), 
+       when(rule_country_mismatch, "COUNTRY_MISMATCH"), ...)
+   ```
+   Example: `"HIGH_AMOUNT,COUNTRY_MISMATCH,NEW_DEVICE_HIGH_AMOUNT,MANY_CUSTOMERS_ON_DEVICE,CARD_NOT_PRESENT_RISK"`
+
+   **Step 4g — Write to scored_transactions (MERGE)**:
+   - Try `DeltaTable.forPath` + `MERGE` (upsert by event_id) — idempotent
+   - If table doesn't exist: `mode("overwrite")` + `overwriteSchema=true` + `partitionBy("event_date")` — initial creation
+   - **Bug fix**: Only overwrite on "Path does not exist" error. All other errors are re-raised (was: broad `except Exception` would overwrite on ANY error → data destruction)
+
+   **Step 4h — Write HIGH risk to alerts table (MERGE)**:
+   - Filter: `risk_band == "HIGH"`
+   - Same MERGE pattern as scored (upsert by event_id)
+   - Same safe error handling (only overwrite on first run)
+
+5. **Start Scoring Stream**: 
+   - `spark.readStream.format("delta").load(silver_tx_path)` — reads Silver transactions
+   - `foreachBatch(safe_scoring_batch)` — calls `process_scoring_batch`
+   - `trigger(processingTime='10s')` — micro-batch every 10 seconds
+   - `queryName("scoring_stream")`
+
+6. **Monitor**: `awaitTermination()` + prints scored counts by risk band and alerts count.
+
+**Output**:
+- Scored Delta: `{SCORED_ROOT}/scored_transactions` (37 columns, partitioned by event_date)
+- Alerts Delta: `{ALERTS_ROOT}/high_risk_alerts` (only HIGH risk transactions)
+
+**Scoring Results** (from validation):
+- Total scored: 5,804 transactions
+- HIGH: 12 (0.2%) — avg score 74.6
+- MEDIUM: 425 (7.3%) — avg score 49.8
+- LOW: 5,367 (92.5%) — avg score 7.6
+- Risk score range: 0-85
+- Alerts: 12 (all HIGH, all with reason codes)
+
+**Why foreachBatch instead of direct streaming writes?**:
+- JOIN with historical Silver data for velocity features (not possible in pure streaming)
+- MERGE into Delta tables (upsert, not just append)
+- Conditional writes (only HIGH risk → alerts table)
+- Multiple writes from same batch (scored + alerts)
+
+---
+
+### Layer 5: 05_gold_stream — Analytics Tables
+
+**Purpose**: Reads scored transactions as a stream and uses `foreachBatch` to recompute 7 gold analytics tables every 60 seconds. These tables power the AI/BI dashboard.
+
+**Cells (7 total)**:
+
+1. **Markdown Title**: Lists all 7 gold tables and their purposes.
+
+2. **Run Config**: `%run ./00_config_stream`
+
+3. **Imports**: PySpark functions (`col`, `when`, `lit`, `count`, `countDistinct`, `sum`, `avg`, `max`), `DeltaTable`.
+
+4. **Gold foreachBatch** (`@safe_foreachbatch process_gold_batch(batch_df, batch_id)`):
+
+   **Step 4a — Skip empty batches**: `if batch_df.limit(1).count() == 0: return`
+
+   **Step 4b — Read ALL scored transactions**: `scored_all = spark.read.format("delta").load(scored_path)` — full table read for recomputing aggregations
+
+   **Step 4c — Recompute 7 gold tables**:
+
+   **Table 1: fraud_summary_by_country** (OVERWRITE):
+   ```sql
+   GROUP BY ip_country → total_transactions, total_amount, avg_risk_score, high_risk_count
+   ```
+   Result: 9 rows (one per country)
+
+   **Table 2: fraud_summary_by_merchant** (OVERWRITE):
+   ```sql
+   GROUP BY merchant_id, merchant_category → total_transactions, total_amount, avg_risk_score, high_risk_count
+   ```
+   Result: 2,828 rows (one per merchant)
+
+   **Table 3: high_risk_transactions** (MERGE):
+   - Filter: `risk_band == "HIGH"` from current batch only
+   - MERGE by event_id (upsert) — only new HIGH risk transactions are added
+   - Result: 12 rows (all HIGH risk transactions)
+
+   **Table 4: customer_risk_profiles** (OVERWRITE):
+   ```sql
+   GROUP BY customer_id → txn_count, total_spent, avg_risk_score, max_risk_score, high_risk_count
+   ```
+   Result: 3,450 rows (one per customer)
+
+   **Table 5: merchant_risk_profiles** (OVERWRITE):
+   ```sql
+   GROUP BY merchant_id → txn_count, total_volume, avg_risk_score, high_risk_count
+   ```
+   Result: 500 rows (one per merchant)
+
+   **Table 6: device_risk_profiles** (OVERWRITE):
+   ```sql
+   GROUP BY device_id → unique_customers (countDistinct), txn_count, avg_risk_score, high_risk_count
+   ```
+   Result: 1,873 rows (one per device)
+
+   **Table 7: chargeback_summary** (OVERWRITE):
+   - Reads from Silver chargebacks (not scored)
+   ```sql
+   GROUP BY reason_code → chargeback_count, total_chargeback_amount
+   ```
+   - **Error handling**: `try/except` with `logger.warning` — if Silver chargebacks don't exist yet, logs warning and continues (was: silent `except: pass`)
+   - Result: 4 rows (one per chargeback reason)
+
+   **Step 4d — Log**: `[Gold] batch {id}: 7 gold tables refreshed`
+
+5. **Start Gold Stream**:
+   - `spark.readStream.format("delta").load(scored_path)` — reads scored transactions
+   - `foreachBatch(safe_gold_batch)` — calls `process_gold_batch`
+   - `trigger(processingTime='60s')` — **60-second trigger** (was 10s, increased for 6x compute saving)
+   - `queryName("gold_stream")`
+
+6. **Monitor**: `awaitTermination()` + prints all 7 gold table counts.
+
+**Why OVERWRITE for 6 tables and MERGE for 1?**:
+- Tables 1, 2, 4, 5, 6 use `mode("overwrite")` because they're aggregations — recomputing from all scored data gives correct results every time. No incremental state needed.
+- Table 3 (high_risk_transactions) uses MERGE because it's a filter, not an aggregation — we only want to ADD new HIGH risk transactions, not recompute.
+
+**Why 60-second trigger?**:
+- Gold tables are analytics — 60-second freshness is more than sufficient for a dashboard
+- 7 full table overwrites every 60s = 7 overwrites/minute (was 42/minute at 10s trigger)
+- 6x reduction in Gold compute overhead
+
+**Output**: 7 Gold Delta tables at `{GOLD_ROOT}/`:
+1. `fraud_summary_by_country` — 9 rows
+2. `fraud_summary_by_merchant` — 2,828 rows
+3. `high_risk_transactions` — 12 rows
+4. `customer_risk_profiles` — 3,450 rows
+5. `merchant_risk_profiles` — 500 rows
+6. `device_risk_profiles` — 1,873 rows
+7. `chargeback_summary` — 4 rows
+
+---
+
+### Layer 6: 06_validation_stream — Data Validation
+
+**Purpose**: One-shot batch notebook that validates the entire pipeline end-to-end. NOT part of the continuous job — run manually after pipeline has processed data.
+
+**Validation Checks (37 total, 100% pass rate)**:
+
+1. **Table Existence & Row Counts** (17 checks): Verifies all Bronze, Silver, Scored, Alerts, and Gold tables exist with expected row counts.
+
+2. **Duplicate Checks** (5 checks): Verifies zero duplicates by `event_id` in Silver and Scored tables.
+
+3. **Risk Band Distribution** (4 checks): Verifies HIGH, MEDIUM, LOW bands are present and risk_score is in valid range [0, 100].
+
+4. **Data Quality Pass Rate** (1 check): Verifies DQ pass rate > 90%. Current: 97.4%.
+
+5. **Gold Table Completeness** (8 checks): Verifies all 7 gold tables are populated and high_risk count is consistent across scored, gold, and alerts (scored=12, gold=12, alerts=12).
+
+6. **Real-Time Alerts Verification** (2 checks): Verifies all alerts are HIGH risk and all have reason codes.
 
 ---
 
@@ -513,7 +919,7 @@ This is a **business-level alert**, not an infrastructure alert. It doesn't fire
 2. **Cloned repo**: Created a Databricks Git folder linked to `https://github.com/guptamasoom/fraudstream-v3.git`
 3. **Copied all 7 notebooks**: Used Databricks SDK `workspace.export` + `workspace.import_` to copy notebooks from the workspace folder to the Git folder
 4. **Created CI/CD files**: Added `databricks.yml` (DABs config) and `.github/workflows/deploy.yml` (GitHub Actions)
-5. **Committed and pushed**: All 9 files pushed to GitHub
+5. **Committed and pushed**: All 10 files pushed to GitHub
 
 ### Files in Git Repo
 
@@ -529,7 +935,8 @@ fraudstream-v3/
 ├── 04_scoring_stream.py        # Silver → fraud rules → Scored + Alerts
 ├── 05_gold_stream.py           # Scored → 7 gold analytics tables
 ├── 06_validation_stream.py     # One-shot validation
-└── databricks.yml              # DABs bundle config
+├── databricks.yml              # DABs bundle config
+└── FraudStream_V3_Production_Guide.md  # This document
 ```
 
 ### Advantage
@@ -676,6 +1083,22 @@ Add these secrets to the GitHub repository:
 
 **A**: The architecture is already designed for it. I would: (1) Replace the synthetic generator with Kafka topics (MSK or Confluent Cloud), (2) Replace Auto Loader's `cloudFiles` source with Kafka source (`kafka` format), (3) Keep the same Bronze→Silver→Scoring→Gold layer architecture, (4) Add schema registry for event validation, (5) Replace rule-based scoring with a trained ML model using chargebacks as delayed labels, (6) Add data retention policies for Delta tables, (7) Send alerts to Slack/PagerDuty instead of just email.
 
+### Q11: Why does Gold use `mode("overwrite")` for 6 tables but MERGE for high_risk_transactions?
+
+**A**: Tables like `fraud_summary_by_country` and `customer_risk_profiles` are aggregations — recomputing from all scored data gives correct results every time. Overwrite is simplest and guaranteed correct. But `high_risk_transactions` is a filter, not an aggregation — we only want to ADD new HIGH risk transactions as they arrive, not recompute. MERGE (upsert by event_id) ensures we don't lose existing HIGH risk records and don't duplicate them.
+
+### Q12: What are the 7 fraud rules and how is the risk score computed?
+
+**A**: The 7 rules are: `rule_high_amount` (amount ≥ $600, weight 20), `rule_country_mismatch` (IP/billing/shipping countries disagree, weight 20), `rule_new_device_high_amount` (new device + high amount, weight 20), `rule_high_velocity` (customer has ≥ 4 transactions, weight 15), `rule_many_customers_on_device` (device used by ≥ 3 customers, weight 10), `rule_failed_login_before_purchase` (≥ 2 failed logins before purchase, weight 10), `rule_card_not_present_risk` (card-not-present + country mismatch, weight 15). The risk score is the weighted sum of all triggered rules, clipped at 100. Risk bands: HIGH (70-100), MEDIUM (40-69), LOW (0-39).
+
+### Q13: What is Auto Loader and why use it instead of regular file reading?
+
+**A**: Auto Loader (`cloudFiles` format) is Databricks' incremental file ingestion system. It uses directory listing + file notification services (like AWS S3 event notifications) to efficiently detect new files as they arrive. Unlike `spark.read` which reads all files at once, Auto Loader tracks which files have been processed using a checkpoint and only reads NEW files in each micro-batch. This makes it ideal for streaming ingestion of JSON/CSV/Parquet files landing in cloud storage. I use it with an explicit `StructType` schema to prevent schema inference drift.
+
+### Q14: What does the `safe_foreachbatch` decorator do and why is it needed?
+
+**A**: The `safe_foreachbatch` decorator wraps any `foreachBatch` function with a try/except that logs the error with the function name and batch ID, then re-raises the exception. This is needed because without it, an unhandled exception in `foreachBatch` would crash the streaming query silently — the query would stop processing but the error might not be visible. With the decorator, errors are logged with full context, and re-raising allows Structured Streaming to retry the batch. If retries are exhausted, the task fails and the job's `ON_FAILURE` retry kicks in, followed by an email alert.
+
 ---
 
 ## Architecture Diagram
@@ -688,7 +1111,7 @@ Add these secrets to the GitHub repository:
 │  │ 01_stream_   │    │ 02_bronze_   │    │ 03_silver_   │    │
 │  │ generator    │───▶│ stream       │───▶│ stream       │    │
 │  │              │    │ (Auto Loader)│    │ (dedup+wmark)│    │
-│  │ 200 ev/5s    │    │ DQ checks    │    │ 10min wmark  │    │
+│  │ 500 ev/5s    │    │ DQ checks    │    │ 10min wmark  │    │
 │  │ infinite     │    │ quarantine   │    │              │    │
 │  └──────────────┘    └──────────────┘    └──────┬───────┘    │
 │                                                  │            │
@@ -718,7 +1141,7 @@ Add these secrets to the GitHub repository:
 │  ┌──────────┐  ┌──────────┐  ┌──────────────────────────┐   │
 │  │ GitHub   │  │ DABs     │  │ GitHub Actions            │   │
 │  │ Repo     │  │ Config   │  │ (validate on PR,          │   │
-│  │ (9 files)│  │ (YAML)   │  │  deploy on main push)     │   │
+│  │ (10 files)│  │ (YAML)   │  │  deploy on main push)     │   │
 │  └──────────┘  └──────────┘  └──────────────────────────┘   │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -767,7 +1190,7 @@ Add these secrets to the GitHub repository:
 | `WATERMARK_DELAY` | `"10 minutes"` | Late data tolerance for Silver dedup |
 | `GENERATOR_DURATION_S` | `0` | Infinite event generation |
 | `TRIGGER_INTERVAL_SECONDS` | `10` | Micro-batch interval |
-| `BATCH_SIZE` | `200` | Events per generator batch |
+| `BATCH_SIZE` | `500` | Events per generator batch |
 | `BATCH_INTERVAL_S` | `5` | Seconds between generator batches |
 | `FRAUD_RATE` | `0.08` | 8% of transactions are fraudulent |
 | `BAD_DATA_RATE` | `0.04` | 4% of events have injected anomalies |
@@ -793,6 +1216,34 @@ Add these secrets to the GitHub repository:
 
 ---
 
+## Validation Results (37/37 checks passed)
+
+| Layer | Table | Rows |
+|-------|-------|------|
+| Bronze | fraud_transactions | 6,062 |
+| Bronze | fraud_logins | 1,448 |
+| Bronze | fraud_devices | 924 |
+| Bronze | fraud_chargebacks | 504 |
+| Silver | fraud_transactions | 5,804 |
+| Silver | fraud_logins | 1,298 |
+| Silver | fraud_devices | 826 |
+| Silver | fraud_chargebacks | 444 |
+| Scored | scored_transactions | 5,804 |
+| Alerts | high_risk_alerts | 12 |
+| Gold | fraud_summary_by_country | 9 |
+| Gold | fraud_summary_by_merchant | 2,828 |
+| Gold | high_risk_transactions | 12 |
+| Gold | customer_risk_profiles | 3,450 |
+| Gold | merchant_risk_profiles | 500 |
+| Gold | device_risk_profiles | 1,873 |
+| Gold | chargeback_summary | 4 |
+
+DQ Pass Rate: 97.4% (8,938 valid / 9,177 total, 239 quarantined)
+Risk Bands: HIGH=12 (0.2%), MEDIUM=425 (7.3%), LOW=5,367 (92.5%)
+Cross-layer consistency: scored=12 = gold=12 = alerts=12 ✅
+
+---
+
 ## Summary: What Made This Production-Grade
 
 | Capability | Status | How |
@@ -805,9 +1256,9 @@ Add these secrets to the GitHub repository:
 | Business alerts | ✅ | SQL anomaly alert (HIGH risk > 50/hour) |
 | Structured logging | ✅ | Python logging with levels in all notebooks |
 | Error handling | ✅ | safe_foreachbatch, fixed broad excepts |
-| Version control | ✅ | GitHub repo with all 9 files |
+| Version control | ✅ | GitHub repo with all 10 files |
 | CI/CD | ✅ | DABs + GitHub Actions (validate on PR, deploy on main) |
-| Validation | ✅ | 06_validation_stream (counts, DQ, risk bands, gold) |
+| Validation | ✅ | 06_validation_stream (37 checks, 100% pass rate) |
 
 ---
 
