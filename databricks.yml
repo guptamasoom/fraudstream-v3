@@ -1,0 +1,75 @@
+# FraudStream V3 — Declarative Automation Bundle (DAB)
+# Deploy with: databricks bundle deploy --target dev
+# Validate with: databricks bundle validate --target dev
+
+bundle:
+  name: fraudstream-v3
+
+variables:
+  job_name:
+    description: "Name of the FraudStream V3 Pipeline job"
+    default: "FraudStream V3 Pipeline"
+  alert_email:
+    description: "Email for failure notifications"
+    default: "masoomgupta0715@gmail.com"
+
+targets:
+  dev:
+    mode: development
+    default: true
+    variables:
+      job_name: "FraudStream V3 Pipeline (DEV)"
+
+  prod:
+    mode: production
+    variables:
+      job_name: "FraudStream V3 Pipeline"
+
+resources:
+  jobs:
+    fraudstream_v3_pipeline:
+      name: ${var.job_name}
+      continuous:
+        pause_status: PAUSED
+        task_retry_mode: ON_FAILURE
+      queue:
+        enabled: true
+      email_notifications:
+        on_failure:
+          - ${var.alert_email}
+      tasks:
+        - task_key: 01_stream_generator
+          notebook_task:
+            notebook_path: /Workspace/Users/masoomgupta0715@gmail.com/fraudstream-v3/01_stream_generator
+            source: WORKSPACE
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        - task_key: 02_bronze_stream
+          notebook_task:
+            notebook_path: /Workspace/Users/masoomgupta0715@gmail.com/fraudstream-v3/02_bronze_stream
+            source: WORKSPACE
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        - task_key: 03_silver_stream
+          notebook_task:
+            notebook_path: /Workspace/Users/masoomgupta0715@gmail.com/fraudstream-v3/03_silver_stream
+            source: WORKSPACE
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        - task_key: 04_scoring_stream
+          notebook_task:
+            notebook_path: /Workspace/Users/masoomgupta0715@gmail.com/fraudstream-v3/04_scoring_stream
+            source: WORKSPACE
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        - task_key: 05_gold_stream
+          notebook_task:
+            notebook_path: /Workspace/Users/masoomgupta0715@gmail.com/fraudstream-v3/05_gold_stream
+            source: WORKSPACE
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}

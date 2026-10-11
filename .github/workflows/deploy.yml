@@ -1,0 +1,39 @@
+# FraudStream V3 — CI/CD Pipeline via GitHub Actions
+# Deploys the Databricks bundle on every push to main branch.
+# Requires DATABRICKS_HOST and DATABRICKS_TOKEN secrets in GitHub repo settings.
+
+name: Deploy FraudStream V3 Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Configure Databricks CLI
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          echo "${DATABRICKS_HOST}" > ~/.databrickscfg
+          echo "${DATABRICKS_TOKEN}" >> ~/.databrickscfg
+
+      - name: Validate bundle (PR)
+        if: github.event_name == 'pull_request'
+        run: databricks bundle validate --target dev
+
+      - name: Deploy bundle (main push)
+        if: github.ref == 'refs/heads/main'
+        run: databricks bundle deploy --target prod
